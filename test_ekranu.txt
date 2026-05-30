@@ -1,0 +1,130 @@
+import time
+import spidev
+from datetime import datetime
+from PIL import Image, ImageDraw, ImageFont
+from gpiozero import OutputDevice, InputDevice
+
+class MojEkran2in9:
+    def __init__(self):
+        self.spi = spidev.SpiDev()
+        self.spi.open(0, 0) 
+        self.spi.max_speed_hz = 4000000
+        self.spi.mode = 0
+        
+        # Piny ekranu zgodnie z nakładką HAT
+        self.dc = OutputDevice(25)
+        self.rst = OutputDevice(17)
+        self.busy = InputDevice(24)
+        
+        self.width = 128
+        self.height = 296
+
+    def _command(self, cmd):
+        self.dc.off()
+        self.spi.xfer2([cmd])
+
+    def _data(self, data):
+        self.dc.on()
+        if isinstance(data, list):
+            self.spi.xfer2(data)
+        else:
+            self.spi.xfer2([data])
+
+    def _wait_busy(self):
+        # Timeout bezpieczeństwa, żeby program się nie zawiesił
+        start = time.time()
+        while self.busy.is_active:
+            if time.time() - start > 5:
+                print("Ostrzeżenie: Ekran zbyt długo nie odpowiada (Busy timeout)")
+                break
+            time.sleep(0.01)
+
+    def reset(self):
+        self.rst.off()
+        time.sleep(0.02)
+        self.rst.on()
+        time.sleep(0.02)
+
+    def wlacz(self):
+        self.reset()
+        self._wait_busy()
+        self._command(0x12) 
+        self._wait_busy()
+        self._command(0x01) 
+        self._data([0x27, 0x01, 0x00])
+        self._command(0x11) 
+        self._data(0x03)
+        self._command(0x44) 
+        self._data([0x00, 0x0F]) 
+        self._command(0x45) 
+        self._data([0x00, 0x00, 0x27, 0x01]) 
+        self._command(0x3C) 
+        self._data(0x05)
+        self._command(0x18) 
+        self._data(0x80)
+        self._command(0x4E) 
+        self._data(0x00)
+        self._command(0x4F) 
+        self._data([0x00, 0x00])
+        self._wait_busy()
+
+    def wyswietl_obraz(self, pil_image):
+        if pil_image.size != (self.width, self.height):
+            pil_image = pil_image.resize((self.width, self.height))
+            
+        bufor = []
+        dane_pikseli = pil_image.getdata()
+        for y in range(self.height):
+            for x in range(0, self.width, 8):
+                bajt = 0
+                for bit in range(8):
+                    piksel = dane_pikseli[y * self.width + (x + bit)]
+                    if piksel > 0: 
+                        bajt |= (1 << (7 - bit))
+                bufor.append(bajt)
+                
+        self._command(0x4E)
+        self._data(0x00)
+        self._command(0x4F)
+        self._data([0x00, 0x00])
+        
+        self._command(0x24) 
+        for i in range(0, len(bufor), 2048):
+            self._data(bufor[i:i+2048])
+            
+        self._command(0x22) 
+        self._data(0xC7)
+        self._command(0x20) 
+        self._wait_busy()
+
+    def uspij(self):
+        self._command(0x10) 
+        self._data(0x01)
+
+def main():
+    print("Rozpoczynam TEST EKRANU E-INK...")
+    ekran = MojEkran2in9()
+    
+    # Używamy najprostszej czcionki systemowej, żeby nic się nie wywaliło
+    font = ImageFont.load_default()
+
+    # Tworzymy czysty obraz (szerokość 296, wysokość 128)
+    canvas = Image.new('1', (296, 128), 255) 
+    draw = ImageDraw.Draw(canvas)
+    
+    # Rysujemy testową zawartość
+    draw.rectangle([(5, 5), (290, 123)], outline=0, width=3)
+    draw.text((40, 35), "EKRAN DZIALA PROSTO Z SPI!", font=font, fill=0)
+    draw.text((40, 70), f"Czas testu: {datetime.now().strftime('%H:%M:%S')}", font=font, fill=0)
+    
+    # Obracamy dla ekranu pionowego
+    obraz_do_wyswietlenia = canvas.rotate(90, expand=True)
+
+    print("Wysyłam obraz na wyświetlacz. Ekran powinien teraz mrugnąć...")
+    ekran.wlacz()
+    ekran.wyswietl_obraz(obraz_do_wyswietlenia)
+    ekran.uspij()
+    print("Test zakończony sukcesem!")
+
+if __name__ == "__main__":
+    main()
