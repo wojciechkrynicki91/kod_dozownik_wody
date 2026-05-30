@@ -1,0 +1,198 @@
+import time
+import spidev
+from datetime import datetime
+from PIL import Image, ImageDraw, ImageFont
+from gpiozero import OutputDevice, InputDevice
+import adafruit_dht
+import board
+
+# =========================================================================
+# 1. TWÓJ WŁASNY, CZYSTY STEROWNIK EKRANU E-INK (Dla Waveshare 2.9" V2)
+# =========================================================================
+class MojEkran2in9:
+    def __init__(self):
+        # Inicjalizacja sprzętowa magistrali SPI Malinki
+        self.spi = spidev.SpiDev()
+        self.spi.open(0, 0)  # SPI0, CE0 (Pin 8 na Malince)
+        self.spi.max_speed_hz = 4000000
+        self.spi.mode = 0
+        
+        # Definicja pinów ekranu zgodnie ze ścieżkami na płytce HAT
+        self.dc = OutputDevice(25)
+        self.rst = OutputDevice(17)
+        self.busy = InputDevice(24)
+        
+        self.width = 128
+        self.height = 296
+
+    def _command(self, cmd):
+        self.dc.off()
+        self.spi.xfer2([cmd])
+
+    def _data(self, data):
+        self.dc.on()
+        if isinstance(data, list):
+            self.spi.xfer2(data)
+        else:
+            self.spi.xfer2([data])
+
+    def _wait_busy(self):
+        # Ekran jest zajęty, gdy pin BUSY ma stan wysoki (1)
+        while self.busy.is_active:
+            time.sleep(0.01)
+
+    def reset(self):
+        self.rst.off()
+        time.sleep(0.02)
+        self.rst.on()
+        time.sleep(0.02)
+
+    def wlacz(self):
+        self.reset()
+        self._wait_busy()
+        
+        self._command(0x12) # Reset programowy (SW Reset)
+        self._wait_busy()
+        
+        self._command(0x01) # Konfiguracja drivera ekranu
+        self._data([0x27, 0x01, 0x00])
+        
+        self._command(0x11) # Tryb wprowadzania danych (Data entry mode)
+        self._data(0x03)
+        
+        self._command(0x44) # Ustawienie zakresu pamięci RAM X
+        self._data([0x00, 0x0F]) # 16 bajtów * 8 bitów = 128 pikseli
+        
+        self._command(0x45) # Ustawienie zakresu pamięci RAM Y
+        self._data([0x00, 0x00, 0x27, 0x01]) # Do 295 linii
+        
+        self._command(0x3C) # Wygląd ramki ekranu
+        self._data(0x05)
+        
+        self._command(0x18) # Użyj wewnętrznego czujnika temperatury ekranu
+        self._data(0x80)
+        
+        self._command(0x4E) # Wyzerowanie licznika RAM X
+        self._data(0x00)
+        
+        self._command(0x4F) # Wyzerowanie licznika RAM Y
+        self._data([0x00, 0x00])
+        self._wait_busy()
+
+    def wyswietl_obraz(self, pil_image):
+        # Dopasowanie rozmiaru obrazu do rozdzielczości ekranu
+        if pil_image.size != (self.width, self.height):
+            pil_image = pil_image.resize((self.width, self.height))
+            
+        # Konwersja obrazu PIL na czyste bajty akceptowane przez ekran
+        bufor = []
+        dane_pikseli = pil_image.getdata()
+        for y in range(self.height):
+            for x in range(0, self.width, 8):
+                bajt = 0
+                for bit in range(8):
+                    piksel = dane_pikseli[y * self.width + (x + bit)]
+                    if piksel > 0:  # Jasny piksel (biały)
+                        bajt |= (1 << (7 - bit))
+                bufor.append(bajt)
+                
+        self._command(0x4E)
+        self._data(0x00)
+        self._command(0x4F)
+        self._data([0x00, 0x00])
+        
+        self._command(0x24) # Komenda zapisu do pamięci RAM ekranu
+        for i in range(0, len(bufor), 2048):
+            self._data(bufor[i:i+2048])
+            
+        self._command(0x22) # Odświeżenie wyświetlacza (Display Update)
+        self._data(0xC7)
+        self._command(0x20) # Aktywacja operacji
+        self._wait_busy()
+
+    def uspij(self):
+        self._command(0x10) # Głębokie uśpienie (oszczędzanie prądu z solara)
+        self._data(0x01)
+
+# =========================================================================
+# 2. GŁÓWNA LOGIKA PROGRAMU (POMPKA, CZUJNIKI I AKTUALIZACJA)
+# =========================================================================
+
+# Konfiguracja czujników na bezpiecznych pinach
+dht_powietrze = adafruit_dht.DHT22(board.D5)       # DHT22 na GPIO 5
+czujnik_gleby = InputDevice(23)                    # LM393 na GPIO 23
+pompka = OutputDevice(27, active_high=True, initial_value=False) # Przekaźnik na GPIO 27
+
+def main():
+    print("Uruchamiam całkowicie niezależną stację podlewania...")
+    ekran = MojEkran2in9()
+    
+    # Ładowanie domyślnej czcionki systemowej Malinki (nie wywali błędu o brak pliku)
+    try:
+        font_naglowek = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18)
+        font_tekst = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
+    except IOError:
+        # Awaryjna czcionka, jeśli w systemie nie ma DejaVu
+        font_naglowek = ImageFont.load_default()
+        font_tekst = ImageFont.load_default()
+
+    while True:
+        # --- 1. Odczyt wilgotności powietrza i temperatury ---
+        try:
+            temp = dht_powietrze.temperature
+            wilg_pow = dht_powietrze.humidity
+            status_powietrza = f"Temp: {temp:.1f}C  |  Wilg: {wilg_pow:.1f}%"
+        except RuntimeError:
+            # Czujniki DHT czasami gubią pakiet, jeśli tak się stanie, zostawiamy stare dane
+            status_powietrza = "Powietrze: Odczyt..."
+
+        # --- 2. Odczyt stanu ziemi oraz sterowanie pompką 12V ---
+        if czujnik_gleby.is_active:  # Moduł LM393 daje stan 1 (True) kiedy jest SUCHO
+            status_ziemi = "Ziemia: SUCHO! Podlewam..."
+            print("Wykryto suchą glebę! Uruchamiam pompkę 12V...")
+            
+            pompka.on()         # Włącz przekaźnik pompy
+            time.sleep(5)       # Podlewaj przez 5 sekund
+            pompka.off()        # Wyłącz przekaźnik pompy
+            
+            status_ziemi = "Ziemia: Podlane pomyslnie!"
+        else:
+            status_ziemi = "Ziemia: Wilgotna (Jest OK)"
+
+        # --- 3. Generowanie czystego obrazu w pamięci (Układ Poziomy) ---
+        # Tworzymy poziomy arkusz roboczy (szerokość 296, wysokość 128)
+        canvas = Image.new('1', (296, 128), 255) # 255 = białe tło
+        draw = ImageDraw.Draw(canvas)
+        
+        # Rysujemy ramki i teksty
+        draw.text((10, 8), "STACJA PODLEWANIA", font=font_naglowek, fill=0)
+        draw.line([(10, 32), (285, 32)], fill=0, width=2)
+        
+        draw.text((10, 42), status_ziemi, font=font_tekst, fill=0)
+        draw.text((10, 68), status_powietrza, font=font_tekst, fill=0)
+        
+        czas_teraz = datetime.now().strftime("%H:%M:%S")
+        draw.text((10, 100), f"Aktualizacja: {czas_teraz} (Solar 12V)", font=font_tekst, fill=0)
+        
+        # Obracamy gotowy obraz o 90 stopni, żeby pasował do pionowej konstrukcji ekranu
+        obraz_do_wyswietlenia = canvas.rotate(90, expand=True)
+
+        # --- 4. Wysłanie danych bezpośrednio na ekran ---
+        try:
+            ekran.wlacz()
+            ekran.wyswietl_obraz(obraz_do_wyswietlenia)
+            ekran.uspij() # Ekran pobiera 0W prądu po uśpieniu! Idealne pod solar.
+        except Exception as e:
+            print(f"Błąd ekranu: {e}")
+
+        # Odczekaj 10 minut (600 sekund) przed kolejnym sprawdzeniem i odświeżeniem ekranu.
+        # Częste odświeżanie niszczy ekrany e-ink, 10-15 minut to idealny czas.
+        print("Pomiary wykonane. Ekran zaktualizowany. Idę spać na 10 minut...")
+        time.sleep(600)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nZatrzymano bezpiecznie system.")
+        pompka.off()
